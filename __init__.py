@@ -1,9 +1,9 @@
-from cerebro_virtual.state import CerebroVirtualConfig, CerebroVirtualState, make_initial_state
-from cerebro_virtual.orchestrator import CerebroVirtualOrchestrator
+try:
+    from cerebro_virtual.state import CerebroVirtualConfig, CerebroVirtualState, make_initial_state
+except Exception:  # pragma: no cover
+    from state import CerebroVirtualConfig, CerebroVirtualState, make_initial_state
 
-__all__ = [
-    "CerebroVirtualConfig",
-    "CerebroVirtualState",
-    "CerebroVirtualOrchestrator",
-    "make_initial_state",
-]
+try:
+    from cerebro_virtual.orchestrator import CerebroVirtualOrchestrator
+except Exception:  # pragma: no cover
+    CerebroVirtualOrchestrator = None
