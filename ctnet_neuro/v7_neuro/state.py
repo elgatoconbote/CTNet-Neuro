@@ -7,7 +7,7 @@ from typing import Any
 @dataclass
 class HolonicNodeState:
     node_id: int
-    dynamic: dict[str, float] = field(default_factory=dict)
+    dynamic: list[float] = field(default_factory=list)
     symbolic: dict[str, float] = field(default_factory=dict)
     body: dict[str, float] = field(default_factory=dict)
     tissue: dict[str, float] = field(default_factory=dict)
@@ -26,5 +26,5 @@ class HolonicNodeState:
 class V7NeuroGlobalState:
     nodes: list[HolonicNodeState]
     topology: list[list[float]]
-    transforms: list[list[list[float]]]
+    transforms: list[list[list[list[float]]]]
     step_count: int = 0
