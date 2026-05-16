@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from cerebro_virtual.state import CerebroVirtualState
+from state import CerebroVirtualState
 
 
 def _clip(value: float, low: float, high: float) -> float:

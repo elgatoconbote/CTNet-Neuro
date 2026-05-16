@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 
-from cerebro_virtual.state import CerebroVirtualConfig, CerebroVirtualState
+from state import CerebroVirtualConfig, CerebroVirtualState
 
 
 def _clip(value: float, low: float, high: float) -> float:

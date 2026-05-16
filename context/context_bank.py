@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import math
 
-from cerebro_virtual.context.context_competition import softmax_scores
-from cerebro_virtual.context.structural_confirmation import is_structurally_confirmed
-from cerebro_virtual.state import CerebroVirtualState
+from context.context_competition import softmax_scores
+from context.structural_confirmation import is_structurally_confirmed
+from state import CerebroVirtualState
 
 
 def _clip(value: float, low: float, high: float) -> float:

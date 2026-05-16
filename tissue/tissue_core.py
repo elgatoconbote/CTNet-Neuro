@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from cerebro_virtual.state import CerebroVirtualState
-from cerebro_virtual.tissue.ctnet_adapter import step_material, summarize_material
+from state import CerebroVirtualState
+from tissue.ctnet_adapter import step_material, summarize_material
 
 
 def _clip(value: float, low: float, high: float) -> float:

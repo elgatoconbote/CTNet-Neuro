@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict
 import math
 
-from cerebro_virtual.state import CerebroVirtualState
+from state import CerebroVirtualState
 
 
 def _norm5(v0, v1, v2, v3, v4):
