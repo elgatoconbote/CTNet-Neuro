@@ -1,0 +1,417 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+import json
+import math
+
+try:
+    from cerebro_virtual.experiments.cv12_bidirectional_reciprocal_alignment import (
+        apply_cv12_bidirectional_alignment as _cv12_apply,
+        collect_cv12_summary as _cv12_collect,
+    )
+except ImportError:
+    from cerebro_virtual.experiments.cv12_bidirectional_reciprocal_alignment import (
+        apply_cv12_supervisor as _cv12_apply,
+        collect_cv12_summary as _cv12_collect,
+    )
+
+
+def _clip(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, float(v)))
+
+
+def _getf(obj: Any, name: str, default: float = 0.0) -> float:
+    try:
+        return float(getattr(obj, name))
+    except Exception:
+        return float(default)
+
+
+def _geti(obj: Any, name: str, default: int = 0) -> int:
+    try:
+        return int(getattr(obj, name))
+    except Exception:
+        return int(default)
+
+
+def _ctx_holder(state: Any) -> Any:
+    return getattr(state, "context", state)
+
+
+def _body_holder(state: Any) -> Any:
+    return getattr(state, "body", state)
+
+
+def _has(obj: Any, name: str) -> bool:
+    try:
+        getattr(obj, name)
+        return True
+    except Exception:
+        return False
+
+
+def _read_attr(state: Any, names: list[str], default: float = 0.0) -> float:
+    holders = [_ctx_holder(state), state, _body_holder(state)]
+    for holder in holders:
+        for n in names:
+            if _has(holder, n):
+                try:
+                    return float(getattr(holder, n))
+                except Exception:
+                    pass
+    return float(default)
+
+
+def _write_attr(state: Any, names: list[str], value: float) -> bool:
+    holders = [_ctx_holder(state), state, _body_holder(state)]
+    for holder in holders:
+        for n in names:
+            if _has(holder, n):
+                try:
+                    setattr(holder, n, float(value))
+                    return True
+                except Exception:
+                    pass
+    return False
+
+
+def _matrix_names(kind: str) -> list[str]:
+    if kind == "transition":
+        return ["transition_matrix", "context_transition_matrix"]
+    if kind == "grammar":
+        return ["transition_grammar_matrix", "context_transition_grammar_matrix"]
+    if kind == "return":
+        return ["return_path_matrix", "context_return_path_matrix"]
+    if kind == "compat":
+        return ["compatibility_matrix", "context_compatibility_matrix"]
+    if kind == "incompat":
+        return ["incompatibility_matrix", "context_incompatibility_matrix"]
+    return []
+
+
+def _get_matrix(state: Any, kind: str):
+    holders = [_ctx_holder(state), state]
+    for holder in holders:
+        for n in _matrix_names(kind):
+            if _has(holder, n):
+                m = getattr(holder, n)
+                try:
+                    # copiar a lista mutable
+                    return n, [list(map(float, row)) for row in m]
+                except Exception:
+                    pass
+    return None, None
+
+
+def _set_matrix(state: Any, name: str, value) -> bool:
+    holders = [_ctx_holder(state), state]
+    for holder in holders:
+        if _has(holder, name):
+            try:
+                setattr(holder, name, value)
+                return True
+            except Exception:
+                pass
+    return False
+
+
+def _mean_offdiag(m) -> float:
+    if not m:
+        return 0.0
+    vals = []
+    n = len(m)
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                vals.append(float(m[i][j]))
+    return sum(vals) / max(1, len(vals))
+
+
+def _pair_score(i: int, j: int, trans, gram, ret, compat, incompat) -> float:
+    if i == j:
+        return -1e9
+    t_ij = float(trans[i][j])
+    t_ji = float(trans[j][i])
+    g_ij = float(gram[i][j])
+    g_ji = float(gram[j][i])
+    r_ij = float(ret[i][j])
+    r_ji = float(ret[j][i])
+    c = 0.5 * (float(compat[i][j]) + float(compat[j][i]))
+    ic = 0.5 * (float(incompat[i][j]) + float(incompat[j][i]))
+    reciprocal = min(t_ij, t_ji)
+    grammar = min(g_ij, g_ji)
+    retu = min(r_ij, r_ji)
+    return (
+        0.42 * reciprocal
+        + 0.26 * grammar
+        + 0.24 * retu
+        + 0.14 * c
+        - 0.12 * ic
+    )
+
+
+def _ensure_route_store(state: Any) -> dict[str, float]:
+    store = getattr(state, "cv14f_route_memory_store", None)
+    if isinstance(store, dict):
+        return store
+    store = {}
+    setattr(state, "cv14f_route_memory_store", store)
+    return store
+
+
+def _route_key(i: int, j: int) -> str:
+    a, b = sorted((int(i), int(j)))
+    return f"{a}-{b}"
+
+
+@dataclass
+class CV14fLog:
+    notes: list[str] = field(default_factory=list)
+    metrics: dict[str, Any] = field(default_factory=dict)
+
+    route_memory_peak: float = 0.0
+    write_gain_peak: float = 0.0
+    expression_license_peak: float = 0.0
+    express_gain_peak: float = 0.0
+    route_recall_peak: float = 0.0
+    unsupported_prune_peak: float = 0.0
+    selected_pair_count_peak: float = 0.0
+    candidate_count_peak: float = 0.0
+    geometry_budget_peak: float = 0.0
+
+    best_pair_last: str = "none"
+    best_pair_score_last: float = 0.0
+    active_slot_last: int = -1
+    partner_last: int = -1
+    alignment_before_last: float = 0.0
+    alignment_after_last: float = 0.0
+
+    def __getattr__(self, name: str):
+        if name.endswith("_peak") or name.endswith("_gain") or name.endswith("_score"):
+            return 0.0
+        if name.endswith("_count") or name.endswith("_idx") or name.endswith("_index"):
+            return 0
+        if name.endswith("_last"):
+            return 0.0
+        return 0.0
+
+
+def apply_cv14f_delayed_route_expression(state: Any, log: CV14fLog) -> None:
+    # baseline geométrica-operativa válida
+    _cv12_apply(state, log)
+
+    active_idx = _geti(state, "active_context_slot", -1)
+    active_dur = _geti(state, "context_active_duration", 0)
+    alignment_before = _read_attr(state, ["context_alignment", "graph_alignment"], 1.0)
+    challenger_margin = _read_attr(state, ["context_best_challenger_margin"], 0.0)
+    pair_mean = _read_attr(state, ["context_regime_overlap_mean", "graph_pair_mean"], 0.0)
+    specificity = _read_attr(state, ["context_binding_specificity_mean", "graph_specificity"], 0.0)
+
+    t_name, trans = _get_matrix(state, "transition")
+    g_name, gram = _get_matrix(state, "grammar")
+    r_name, ret = _get_matrix(state, "return")
+    c_name, compat = _get_matrix(state, "compat")
+    ic_name, incompat = _get_matrix(state, "incompat")
+
+    if not all([trans, gram, ret, compat, incompat]):
+        log.notes.append("cv14f_no_matrices")
+        return
+
+    n = len(trans)
+    if active_idx < 0 or active_idx >= n:
+        log.notes.append("cv14f_bad_active_idx")
+        return
+
+    candidates: list[tuple[float, int, int]] = []
+    for j in range(n):
+        if j == active_idx:
+            continue
+        s = _pair_score(active_idx, j, trans, gram, ret, compat, incompat)
+        if s > 0.18:
+            candidates.append((s, active_idx, j))
+
+    candidates.sort(reverse=True)
+    log.candidate_count_peak = max(log.candidate_count_peak, float(len(candidates)))
+
+    best_score, _, best_j = candidates[0] if candidates else (0.0, active_idx, -1)
+    best_pair = f"{min(active_idx, best_j)}-{max(active_idx, best_j)}" if best_j >= 0 else "none"
+
+    # Presupuesto geométrico marginal: cuanto más limpio el manifold, más licencia local.
+    # Se castiga overlap y se premia specificity; no toca bindings.
+    geom_headroom = _clip(2.0 * (0.32 - pair_mean), 0.0, 1.0)
+    spec_headroom = _clip(1.85 * (specificity - 0.54), 0.0, 1.0)
+    budget = _clip(0.55 * geom_headroom + 0.45 * spec_headroom, 0.0, 1.0)
+    log.geometry_budget_peak = max(log.geometry_budget_peak, budget)
+
+    # Escritura pequeña online: solo si hay legitimidad recíproca y margen competitivo local.
+    write_gate = (
+        _clip((best_score - 0.62) / 0.28, 0.0, 1.0)
+        * _clip((active_dur - 3) / 8.0, 0.0, 1.0)
+        * _clip((0.03 - challenger_margin) / 0.03, 0.0, 1.0)
+        * budget
+    )
+
+    store = _ensure_route_store(state)
+    if best_j >= 0 and write_gate > 0.0:
+        k = _route_key(active_idx, best_j)
+        old = float(store.get(k, 0.0))
+        write_gain = min(0.016, 0.016 * write_gate)
+        new = _clip(old + write_gain * (1.0 - old / 0.18), 0.0, 0.18)
+        store[k] = new
+        route_memory = new
+    else:
+        write_gain = 0.0
+        route_memory = 0.0
+
+    # Expresión diferida:
+    # 1) permanencia mínima
+    # 2) déficit real local de alignment
+    # 3) margen competitivo suficiente
+    # 4) memoria ya escrita
+    local_deficit = _clip((0.992 - alignment_before) / 0.05, 0.0, 1.0)
+    license_gate = (
+        _clip((active_dur - 6) / 10.0, 0.0, 1.0)
+        * local_deficit
+        * _clip((best_score - 0.68) / 0.22, 0.0, 1.0)
+        * _clip((0.028 - challenger_margin) / 0.028, 0.0, 1.0)
+    )
+
+    if best_j >= 0:
+        route_recall = float(store.get(_route_key(active_idx, best_j), 0.0))
+    else:
+        route_recall = 0.0
+
+    express_gain = min(0.0085, 0.24 * math.sqrt(max(route_recall, 0.0)) * license_gate)
+    selected_count = 1.0 if (best_j >= 0 and express_gain > 0.0) else 0.0
+
+    # Aplicación local, sin tocar bindings.
+    if best_j >= 0 and express_gain > 0.0:
+        # refuerzo protegido de gramática/retorno/transición en la ruta legítima
+        gram[active_idx][best_j] = _clip(gram[active_idx][best_j] + express_gain, 0.0, 1.0)
+        gram[best_j][active_idx] = _clip(gram[best_j][active_idx] + 0.78 * express_gain, 0.0, 1.0)
+
+        ret[active_idx][best_j] = _clip(ret[active_idx][best_j] + 0.92 * express_gain, 0.0, 1.0)
+        ret[best_j][active_idx] = _clip(ret[best_j][active_idx] + 0.72 * express_gain, 0.0, 1.0)
+
+        trans[active_idx][best_j] = _clip(trans[active_idx][best_j] + 0.48 * express_gain, 0.0, 1.0)
+        trans[best_j][active_idx] = _clip(trans[best_j][active_idx] + 0.34 * express_gain, 0.0, 1.0)
+
+    # poda local no esterilizante: solo transiciones altas sin respaldo recíproco ni memoria
+    prune_peak = 0.0
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            reciprocal_support = min(float(trans[i][j]), float(trans[j][i]))
+            grammar_support = min(float(gram[i][j]), float(gram[j][i]))
+            route_support = float(store.get(_route_key(i, j), 0.0))
+            unsupported = max(0.0, float(trans[i][j]) - (0.62 * reciprocal_support + 0.42 * grammar_support + 0.95 * route_support))
+            if unsupported > 0.34:
+                prune = min(0.0038, 0.06 * (unsupported - 0.34))
+                trans[i][j] = _clip(trans[i][j] - prune, 0.0, 1.0)
+                prune_peak = max(prune_peak, prune)
+
+    # pequeña realineación operativa local solo si hubo expresión real
+    alignment_after = alignment_before
+    if best_j >= 0 and express_gain > 0.0:
+        lift = min(0.0032, 0.42 * express_gain)
+        alignment_after = _clip(alignment_before + lift, 0.0, 1.0)
+        _write_attr(state, ["context_alignment", "graph_alignment"], alignment_after)
+
+    # persistir matrices
+    if t_name:
+        _set_matrix(state, t_name, trans)
+    if g_name:
+        _set_matrix(state, g_name, gram)
+    if r_name:
+        _set_matrix(state, r_name, ret)
+
+    # persistir trazas agregadas para que el resumen refleje la intervención
+    _write_attr(state, ["context_transition_trace", "graph_transition"], _mean_offdiag(trans))
+    _write_attr(state, ["context_grammar_trace", "graph_grammar"], _mean_offdiag(gram))
+    _write_attr(state, ["context_return_trace", "graph_return"], _mean_offdiag(ret))
+
+    # métricas CV14f
+    setattr(state, "cv14f_route_memory_peak", max(float(getattr(state, "cv14f_route_memory_peak", 0.0)), route_memory))
+    setattr(state, "cv14f_write_gain_peak", max(float(getattr(state, "cv14f_write_gain_peak", 0.0)), write_gain))
+    setattr(state, "cv14f_expression_license_peak", max(float(getattr(state, "cv14f_expression_license_peak", 0.0)), license_gate))
+    setattr(state, "cv14f_express_gain_peak", max(float(getattr(state, "cv14f_express_gain_peak", 0.0)), express_gain))
+    setattr(state, "cv14f_route_recall_peak", max(float(getattr(state, "cv14f_route_recall_peak", 0.0)), route_recall))
+    setattr(state, "cv14f_unsupported_prune_peak", max(float(getattr(state, "cv14f_unsupported_prune_peak", 0.0)), prune_peak))
+    setattr(state, "cv14f_selected_pair_count_peak", max(float(getattr(state, "cv14f_selected_pair_count_peak", 0.0)), selected_count))
+    setattr(state, "cv14f_candidate_count_peak", max(float(getattr(state, "cv14f_candidate_count_peak", 0.0)), float(len(candidates))))
+    setattr(state, "cv14f_geometry_budget_peak", max(float(getattr(state, "cv14f_geometry_budget_peak", 0.0)), budget))
+
+    setattr(state, "cv14f_route_memory_last", route_memory)
+    setattr(state, "cv14f_route_recall_last", route_recall)
+    setattr(state, "cv14f_write_gain_last", write_gain)
+    setattr(state, "cv14f_expression_license_last", license_gate)
+    setattr(state, "cv14f_express_gain_last", express_gain)
+    setattr(state, "cv14f_unsupported_prune_last", prune_peak)
+    setattr(state, "cv14f_active_slot_last", int(active_idx))
+    setattr(state, "cv14f_partner_last", int(best_j))
+    setattr(state, "cv14f_best_pair_last", best_pair)
+    setattr(state, "cv14f_best_pair_score_last", float(best_score))
+    setattr(state, "cv14f_alignment_before_last", float(alignment_before))
+    setattr(state, "cv14f_alignment_after_last", float(alignment_after))
+
+    log.route_memory_peak = max(log.route_memory_peak, route_memory)
+    log.write_gain_peak = max(log.write_gain_peak, write_gain)
+    log.expression_license_peak = max(log.expression_license_peak, license_gate)
+    log.express_gain_peak = max(log.express_gain_peak, express_gain)
+    log.route_recall_peak = max(log.route_recall_peak, route_recall)
+    log.unsupported_prune_peak = max(log.unsupported_prune_peak, prune_peak)
+    log.selected_pair_count_peak = max(log.selected_pair_count_peak, selected_count)
+    log.candidate_count_peak = max(log.candidate_count_peak, float(len(candidates)))
+    log.geometry_budget_peak = max(log.geometry_budget_peak, budget)
+
+    log.best_pair_last = best_pair
+    log.best_pair_score_last = float(best_score)
+    log.active_slot_last = int(active_idx)
+    log.partner_last = int(best_j)
+    log.alignment_before_last = float(alignment_before)
+    log.alignment_after_last = float(alignment_after)
+
+
+def collect_cv14f_summary(state: Any, baseline_summary: Any = None, log: CV14fLog | None = None) -> dict[str, Any]:
+    def _keep(v: Any) -> bool:
+        return isinstance(v, (int, float, str, bool, list, dict)) or v is None
+
+    if log is None and isinstance(baseline_summary, CV14fLog):
+        log = baseline_summary
+        baseline_summary = None
+
+    data: dict[str, Any] = {}
+    if isinstance(baseline_summary, dict):
+        for k, v in baseline_summary.items():
+            if _keep(v):
+                data[k] = v
+    else:
+        try:
+            base = _cv12_collect(state)
+            if isinstance(base, dict):
+                for k, v in base.items():
+                    if _keep(v):
+                        data[k] = v
+        except Exception:
+            pass
+
+    # sobrescribir claves resumen desde el estado ya modificado
+    for k in [
+        "graph_transition",
+        "graph_grammar",
+        "graph_return",
+        "graph_alignment",
+    ]:
+        if hasattr(state, k):
+            data[k] = getattr(state, k)
+
+    for k, v in vars(state).items():
+        if str(k).startswith("cv14f_") and _keep(v):
+            data[k] = v
+
+    if log is not None:
+        data["cv14f_notes_count"] = len(getattr(log, "notes", []))
+
+    return data

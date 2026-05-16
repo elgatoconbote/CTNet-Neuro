@@ -1,0 +1,463 @@
+from __future__ import annotations
+
+try:
+    except ImportError:
+    apply_cv12_supervisor = _cv12_apply
+collect_cv12_summary = _cv12_collect
+
+
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+
+
+
+def _clip(value: float, low: float, high: float) -> float:
+    return max(low, min(high, float(value)))
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _get_attr(obj, *names, default=None):
+    for name in names:
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return default
+
+
+def _matrix(ctx, name: str, n: int) -> List[List[float]]:
+    raw = getattr(ctx, name, None)
+    if raw is None:
+        return [[0.0 for _ in range(n)] for _ in range(n)]
+    out = [[0.0 for _ in range(n)] for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            try:
+                out[i][j] = float(raw[i][j])
+            except Exception:
+                out[i][j] = 0.0
+    return out
+
+
+def _write_back_matrix(ctx, name: str, mat: List[List[float]]) -> None:
+    raw = getattr(ctx, name, None)
+    if raw is None:
+        setattr(ctx, name, [row[:] for row in mat])
+        return
+    try:
+        n = len(mat)
+        for i in range(n):
+            for j in range(n):
+                raw[i][j] = float(mat[i][j])
+    except Exception:
+        setattr(ctx, name, [row[:] for row in mat])
+
+
+def _offdiag_mean(mat: List[List[float]]) -> float:
+    n = len(mat)
+    if n <= 1:
+        return 0.0
+    acc = 0.0
+    c = 0
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            acc += float(mat[i][j])
+            c += 1
+    return acc / max(1, c)
+
+
+def _pairwise_mean(mat: List[List[float]]) -> float:
+    n = len(mat)
+    if n <= 1:
+        return 0.0
+    acc = 0.0
+    c = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            acc += 0.5 * (float(mat[i][j]) + float(mat[j][i]))
+            c += 1
+    return acc / max(1, c)
+
+
+def _active_index(state, ctx) -> int:
+    idx = _get_attr(ctx, "active_index", "active_slot", default=None)
+    if idx is None:
+        idx = _get_attr(state, "active_context_slot", default=0)
+    return int(idx or 0)
+
+
+def _active_duration(state, ctx) -> float:
+    value = _get_attr(ctx, "active_duration", default=None)
+    if value is None:
+        value = _get_attr(state, "context_active_duration", default=0.0)
+    return _safe_float(value, 0.0)
+
+
+def _alignment(state, ctx) -> float:
+    value = _get_attr(state, "context_alignment", default=None)
+    if value is None:
+        value = _get_attr(ctx, "alignment", default=1.0)
+    return _safe_float(value, 1.0)
+
+
+def _best_margin(state, ctx) -> float:
+    value = _get_attr(state, "context_best_challenger_margin", default=None)
+    if value is None:
+        value = _get_attr(ctx, "best_challenger_margin", default=0.0)
+    return _safe_float(value, 0.0)
+
+
+@dataclass
+class CV14eCache:
+    route_memory: List[List[float]]
+    best_pair: Optional[Tuple[int, int]] = None
+
+
+def _ensure_cache(state, n: int) -> CV14eCache:
+    cache = getattr(state, "_cv14e_cache", None)
+    if cache is None or len(cache.route_memory) != n:
+        cache = CV14eCache(route_memory=[[0.0 for _ in range(n)] for _ in range(n)])
+        setattr(state, "_cv14e_cache", cache)
+    return cache
+
+
+def _candidate_pairs(trans, gram, ret, comp):
+    n = len(trans)
+    pairs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            rec = min(trans[i][j], trans[j][i])
+            if rec <= 0.0:
+                continue
+            g = min(gram[i][j], gram[j][i])
+            r = min(ret[i][j], ret[j][i])
+            c = 0.5 * (comp[i][j] + comp[j][i])
+            score = rec * (0.40 + 0.35 * g + 0.25 * r) * (0.25 + 0.75 * c)
+            pairs.append((score, i, j, rec, g, r, c))
+    pairs.sort(reverse=True, key=lambda x: x[0])
+    return pairs
+
+
+def _duration_license(active_duration: float) -> float:
+    # expresión fuerte solo a partir de permanencia real
+    return _clip((active_duration - 6.0) / 8.0, 0.0, 1.0)
+
+
+def _deficit_license(alignment: float) -> float:
+    # si no hay déficit local, no hace falta expresar memoria
+    return _clip((0.9960 - alignment) / 0.040, 0.0, 1.0)
+
+
+def _margin_license(best_margin: float) -> float:
+    # si el margen competitivo es muy frágil, bloquear expresión fuerte
+    return _clip((best_margin - 0.008) / 0.040, 0.0, 1.0)
+
+
+def _geometry_headroom(state) -> float:
+    pair_mean = _safe_float(_get_attr(state, "context_regime_overlap_mean", "graph_pair_mean", default=0.0), 0.0)
+    specificity = _safe_float(_get_attr(state, "context_binding_specificity_mean", "graph_specificity", default=0.0), 0.0)
+    row_min = _safe_float(_get_attr(state, "context_binding_row_min", "graph_row_min", default=0.8), 0.8)
+
+    overlap_term = _clip((0.26 - pair_mean) / 0.18, 0.0, 1.0)
+    spec_term = _clip((specificity - 0.48) / 0.18, 0.0, 1.0)
+    row_term = _clip((row_min - 0.75) / 0.08, 0.0, 1.0)
+
+    return _clip(0.45 * overlap_term + 0.35 * spec_term + 0.20 * row_term, 0.0, 1.0)
+
+
+def _update_summary_metrics(state, trans, gram, ret) -> None:
+    setattr(state, "context_transition_matrix_mean", _offdiag_mean(trans))
+    setattr(state, "context_transition_trace", max(_safe_float(getattr(state, "context_transition_trace", 0.0), 0.0),
+                                                   _clip(_offdiag_mean(trans) * 1.40, 0.0, 1.0)))
+    setattr(state, "context_grammar_trace", max(_safe_float(getattr(state, "context_grammar_trace", 0.0), 0.0),
+                                                _clip(_offdiag_mean(gram) * 1.45, 0.0, 1.0)))
+    setattr(state, "context_return_trace", max(_safe_float(getattr(state, "context_return_trace", 0.0), 0.0),
+                                               _clip(_offdiag_mean(ret) * 1.55, 0.0, 1.0)))
+    setattr(state, "context_transition_grammar_mean", _offdiag_mean(gram))
+    setattr(state, "context_return_path_mean", _offdiag_mean(ret))
+
+    dev = getattr(state, "development", None)
+    if dev is not None:
+        if hasattr(dev, "grammar_stability"):
+            dev.grammar_stability = max(_safe_float(dev.grammar_stability, 0.0), _offdiag_mean(gram) * 0.52)
+        if hasattr(dev, "return_stability"):
+            dev.return_stability = max(_safe_float(dev.return_stability, 0.0), _offdiag_mean(ret) * 0.40)
+        if hasattr(dev, "graph_maturation"):
+            dev.graph_maturation = max(_safe_float(dev.graph_maturation, 0.0), 0.12 + 0.88 * _pairwise_mean(trans))
+
+
+def _set_peak(state, name: str, value: float) -> None:
+    setattr(state, name, max(_safe_float(getattr(state, name, 0.0), 0.0), float(value)))
+
+
+def apply_cv14e_supervisor(state, log) -> None:
+    # baseline geométrica-operativa
+    apply_cv12_supervisor(state, log)
+
+    ctx = getattr(state, "context", None)
+    if ctx is None:
+        return
+
+    n = len(getattr(ctx, "hypotheses", [])) or len(getattr(ctx, "transition_matrix", [])) or 4
+    cache = _ensure_cache(state, n)
+
+    trans = _matrix(ctx, "transition_matrix", n)
+    gram = _matrix(ctx, "transition_grammar_matrix", n)
+    ret = _matrix(ctx, "return_path_matrix", n)
+    comp = _matrix(ctx, "compatibility_matrix", n)
+
+    active = _active_index(state, ctx)
+    active_duration = _active_duration(state, ctx)
+    alignment_before = _alignment(state, ctx)
+    best_margin = _best_margin(state, ctx)
+
+    geometry_headroom = _geometry_headroom(state)
+    # presupuesto solo para escritura; expresión necesita además licencia local
+    write_budget = _clip(
+        geometry_headroom
+        * _clip((alignment_before - 0.955) / 0.045, 0.0, 1.0)
+        * _clip(1.0 - 0.60 * _pairwise_mean(trans), 0.0, 1.0),
+        0.0,
+        1.0,
+    )
+
+    pairs = _candidate_pairs(trans, gram, ret, comp)
+    selected = pairs[:1] if write_budget > 0.06 and pairs else []
+    cache.best_pair = (selected[0][1], selected[0][2]) if selected else None
+
+    # 1) escritura pequeña, saturada y lenta
+    for i in range(n):
+        for j in range(n):
+            cache.route_memory[i][j] *= 0.9925
+
+    for score, i, j, rec, g, r, c in selected:
+        # saturación parcial, no permitir route_memory exuberante
+        mem = cache.route_memory[i][j]
+        cap = 0.16 + 0.06 * geometry_headroom
+        write_gain = (0.00055 + 0.00120 * write_budget * score) * (0.35 + 0.65 * c)
+        mem = _clip(mem + write_gain, 0.0, cap)
+        cache.route_memory[i][j] = mem
+        cache.route_memory[j][i] = mem
+        _set_peak(state, "cv14e_write_gain_peak", write_gain)
+
+    # 2) expresión protegida solo si la memoria ya existe y la licencia local lo permite
+    duration_gate = _duration_license(active_duration)
+    deficit_gate = _deficit_license(alignment_before)
+    margin_gate = _margin_license(best_margin)
+    expression_license = duration_gate * deficit_gate * margin_gate
+
+    express_gain = 0.0
+    best_pair_last = "none"
+    best_pair_score_last = 0.0
+    partner_last = -1
+
+    if selected and expression_license > 0.0:
+        score, i, j, rec, g, r, c = selected[0]
+        best_pair_last = f"{i}-{j}"
+        best_pair_score_last = score
+
+        if active in (i, j):
+            partner = j if active == i else i
+            partner_last = partner
+
+            recalled = cache.route_memory[i][j]
+            # la expresión es más fuerte que la escritura, pero sigue muy acotada
+            express_gain = (
+                (0.0018 + 0.0068 * recalled)
+                * expression_license
+                * (0.35 + 0.65 * score)
+                * (0.40 + 0.60 * c)
+            )
+            express_gain = _clip(express_gain, 0.0, 0.0125)
+
+            # refuerzo relacional protegido
+            gram[i][j] = _clip(gram[i][j] + express_gain, 0.0, 1.0)
+            gram[j][i] = _clip(gram[j][i] + 0.92 * express_gain, 0.0, 1.0)
+            ret[i][j] = _clip(ret[i][j] + 0.86 * express_gain, 0.0, 1.0)
+            ret[j][i] = _clip(ret[j][i] + 0.80 * express_gain, 0.0, 1.0)
+            trans[i][j] = _clip(trans[i][j] + 0.20 * express_gain, 0.0, 1.0)
+            trans[j][i] = _clip(trans[j][i] + 0.18 * express_gain, 0.0, 1.0)
+
+    # 3) poda local de transiciones no respaldadas; menos esterilizante que CV14c/d
+    unsupported_prune_peak = 0.0
+    selected_edges = set()
+    if selected:
+        _, i, j, *_ = selected[0]
+        selected_edges.add((i, j))
+        selected_edges.add((j, i))
+
+    for i in range(n):
+        for j in range(n):
+            if i == j or (i, j) in selected_edges:
+                continue
+            reciprocal = min(trans[i][j], trans[j][i])
+            route_support = 0.5 * min(gram[i][j], gram[j][i]) + 0.5 * min(ret[i][j], ret[j][i])
+            c = 0.5 * (comp[i][j] + comp[j][i])
+            unsupported = max(0.0, trans[i][j] - (0.42 * reciprocal + 0.28 * route_support + 0.18 * c))
+            prune = (0.0012 + 0.0065 * write_budget) * unsupported
+            unsupported_prune_peak = max(unsupported_prune_peak, prune)
+            trans[i][j] = _clip(trans[i][j] - prune, 0.0, 1.0)
+            gram[i][j] = _clip(gram[i][j] - 0.35 * prune, 0.0, 1.0)
+            ret[i][j] = _clip(ret[i][j] - 0.22 * prune, 0.0, 1.0)
+
+    _write_back_matrix(ctx, "transition_matrix", trans)
+    _write_back_matrix(ctx, "transition_grammar_matrix", gram)
+    _write_back_matrix(ctx, "return_path_matrix", ret)
+
+    _update_summary_metrics(state, trans, gram, ret)
+
+    alignment_after = _alignment(state, ctx)
+
+    _set_peak(state, "cv14e_route_memory_peak", max(max(row) for row in cache.route_memory))
+    _set_peak(state, "cv14e_expression_license_peak", expression_license)
+    _set_peak(state, "cv14e_express_gain_peak", express_gain)
+    _set_peak(state, "cv14e_unsupported_prune_peak", unsupported_prune_peak)
+    _set_peak(state, "cv14e_geometry_headroom_peak", geometry_headroom)
+    _set_peak(state, "cv14e_write_budget_peak", write_budget)
+    _set_peak(state, "cv14e_candidate_count_peak", float(len(pairs)))
+    _set_peak(state, "cv14e_selected_pair_count_peak", float(len(selected)))
+
+    setattr(state, "cv14e_write_budget_last", write_budget)
+    setattr(state, "cv14e_candidate_count_last", len(pairs))
+    setattr(state, "cv14e_selected_pair_count_last", len(selected))
+    setattr(state, "cv14e_best_pair_last", best_pair_last)
+    setattr(state, "cv14e_best_pair_score_last", best_pair_score_last)
+    setattr(state, "cv14e_active_slot_last", active)
+    setattr(state, "cv14e_partner_last", partner_last)
+    setattr(state, "cv14e_alignment_before_last", alignment_before)
+    setattr(state, "cv14e_alignment_after_last", alignment_after)
+
+# ==== CV14e compatibility shim ====
+from dataclasses import dataclass, field
+from typing import Any
+import json
+
+try:
+    except Exception:
+    _collect_cv12_summary = None
+
+
+@dataclass
+class CV14eLog:
+    notes: list[str] = field(default_factory=list)
+    metrics: dict[str, Any] = field(default_factory=dict)
+
+
+def _cv14e_scalar(value):
+    return isinstance(value, (int, float, str, bool)) or value is None
+
+
+def _cv14e_maybe(value):
+    if _cv14e_scalar(value):
+        return value
+    if isinstance(value, (list, tuple)):
+        out = []
+        for v in value:
+            if _cv14e_scalar(v):
+                out.append(v)
+            elif isinstance(v, (list, tuple)):
+                row = []
+                ok = True
+                for x in v:
+                    if _cv14e_scalar(x):
+                        row.append(x)
+                    else:
+                        ok = False
+                        break
+                if ok:
+                    out.append(row)
+                else:
+                    return None
+            else:
+                return None
+        return out
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if not isinstance(k, str):
+                k = str(k)
+            mv = _cv14e_maybe(v)
+            if mv is not None:
+                out[k] = mv
+        return out
+    return None
+
+
+def _collect_state_scalars(state):
+    summary = {}
+    for k, v in vars(state).items():
+        if k.startswith("_"):
+            continue
+        mv = _cv14e_maybe(v)
+        if mv is not None:
+            summary[k] = mv
+
+    for attr_name, prefix in [
+        ("development", "development_"),
+        ("body", "body_"),
+        ("world", "world_"),
+        ("offline", "offline_"),
+    ]:
+        obj = getattr(state, attr_name, None)
+        if obj is None:
+            continue
+        for k, v in vars(obj).items():
+            mv = _cv14e_maybe(v)
+            if mv is not None:
+                summary[f"{prefix}{k}"] = mv
+    return summary
+
+
+def apply_cv14e_bidirectional_alignment(state, log):
+    if "apply_cv14e_supervisor" in globals():
+        return apply_cv14e_supervisor(state, log)
+    if "apply_cv14e_delayed_route_expression" in globals():
+        return apply_cv14e_delayed_route_expression(state, log)
+            apply_cv12_bidirectional_alignment,
+    return apply_cv12_bidirectional_alignment(state, log)
+
+
+def collect_cv14e_summary(state, log):
+    summary = {}
+    if _collect_cv12_summary is not None:
+        try:
+            summary.update(_collect_cv12_summary(state, log))
+        except Exception:
+            pass
+
+    summary.update(_collect_state_scalars(state))
+
+    extra_keys = [
+        "cv14e_route_memory_peak",
+        "cv14e_write_gain_peak",
+        "cv14e_expression_license_peak",
+        "cv14e_express_gain_peak",
+        "cv14e_unsupported_prune_peak",
+        "cv14e_geometry_headroom_peak",
+        "cv14e_write_budget_peak",
+        "cv14e_candidate_count_peak",
+        "cv14e_selected_pair_count_peak",
+        "cv14e_write_budget_last",
+        "cv14e_candidate_count_last",
+        "cv14e_selected_pair_count_last",
+        "cv14e_best_pair_last",
+        "cv14e_best_pair_score_last",
+        "cv14e_active_slot_last",
+        "cv14e_partner_last",
+        "cv14e_alignment_before_last",
+        "cv14e_alignment_after_last",
+    ]
+
+    for k in extra_keys:
+        if hasattr(state, k):
+            v = _cv14e_maybe(getattr(state, k))
+            if v is not None:
+                summary[k] = v
+
+    return summary
