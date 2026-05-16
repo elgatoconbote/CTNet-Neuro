@@ -1,5 +1,5 @@
 from cerebro_virtual.state import CerebroVirtualConfig, CerebroVirtualState, make_initial_state
-from cerebro_virtual.orchestrator import CerebroVirtualOrchestrator
+from cerebro_virtual import CerebroVirtualOrchestrator
 
 __all__ = [
     "CerebroVirtualConfig",
